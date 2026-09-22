@@ -87,7 +87,7 @@ function fail(res, e) {
 // Голос — через цепочку перебора: модели x mime-форматы, первая рабочая
 // комбинация запоминается. Официально аудио принимают: 3.8/3.7/3.6/3.5 Flash,
 // 3.5/3.1/2.5 Flash-Lite, 2.5 Flash (mime: audio/ogg и audio/opus).
-const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.5-transcribe,gemini-2.5-flash'
+const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash'
 let voiceOk = null // {model, mime} — найденная рабочая комбинация
 
 async function callGemini(env, parts, jsonOut, model) {
@@ -100,14 +100,16 @@ async function callGemini(env, parts, jsonOut, model) {
   if (jsonOut) generationConfig.responseMimeType = 'application/json'
   if (env.THINKING_LEVEL) generationConfig.thinkingConfig = { thinkingLevel: env.THINKING_LEVEL }
 
-  const r = await fetch(API_BASE + (model || env.GEMINI_MODEL || 'gemini-3.5-flash-lite') + ':generateContent', {
+  const useModel = model || env.GEMINI_MODEL || 'gemini-3.5-flash-lite'
+  const bodyObj = { contents: [{ role: 'user', parts }], generationConfig }
+  if (useModel.indexOf('transcribe') < 0) {
+    // транскрайб-модели отклоняют system_instruction ("Developer instruction is not enabled")
+    bodyObj.system_instruction = { parts: [{ text: SYSTEM_PROMPT }] }
+  }
+  const r = await fetch(API_BASE + useModel + ':generateContent', {
     method: 'POST',
     headers: { 'x-goog-api-key': env.GEMINI_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
-      contents: [{ role: 'user', parts }],
-      generationConfig,
-    }),
+    body: JSON.stringify(bodyObj),
   })
   if (!r.ok) throw new Error('Gemini ' + r.status + ': ' + (await r.text()).slice(0, 200))
   const d = await r.json()
@@ -270,19 +272,28 @@ async function askVoice(env, b64) {
 
   // диагностика формата: настоящие OggOpus начинаются с 'OggS'
   let magic = ''
+  let detected = null // контейнер по магии: OggS=ogg, ftyp=mp4/m4a (AAC), ID3=mp3
   try {
     magic = String.fromCharCode.apply(null, bytes.subarray(0, 4))
+    const b8 = String.fromCharCode.apply(null, bytes.subarray(4, 8))
+    if (magic === 'OggS') detected = 'audio/ogg'
+    else if (b8 === 'ftyp') detected = 'audio/mp4'
+    else if (magic.slice(0, 3) === 'ID3' || bytes[0] === 0xff) detected = 'audio/mp3'
   } catch (e) {}
-  console.error('[aiwatch] аудио: ' + bytes.length + 'Б, магия=' + JSON.stringify(magic))
+  console.error(
+    '[aiwatch] аудио: ' + bytes.length + 'Б, магия=' + JSON.stringify(magic) +
+      (detected ? ', контейнер=' + detected : ', НЕОПОЗНАН'),
+  )
 
   const models = String(env.VOICE_MODELS || VOICE_DEFAULTS)
     .split(',')
     .map((s) => s.trim())
     .filter((m) => m && !rejectedModels.has(m))
-  const mimes = String(env.VOICE_MIMES || 'audio/ogg,audio/opus')
+  let mimes = String(env.VOICE_MIMES || 'audio/ogg,audio/opus')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
+  if (detected) mimes = [detected].concat(mimes.filter((m) => m !== detected))
 
   let lastErr = null
 
@@ -304,8 +315,9 @@ async function askVoice(env, b64) {
   if (!sdkBroken) {
     for (const m of models) {
       try {
-        const r = await voiceAttemptFile(env, m, 'audio/ogg', b64, true)
-        voiceOk = { kind: 'file', model: m, mime: 'audio/ogg', jsonMode: true }
+        const fileMime = detected || 'audio/ogg'
+        const r = await voiceAttemptFile(env, m, fileMime, b64, true)
+        voiceOk = { kind: 'file', model: m, mime: fileMime, jsonMode: true }
         return r
       } catch (e) {
         if (String((e && e.message) || e).indexOf('sdk-unavailable') >= 0) {
