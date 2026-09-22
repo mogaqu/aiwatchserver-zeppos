@@ -87,7 +87,7 @@ function fail(res, e) {
 // Голос — через цепочку перебора: модели x mime-форматы, первая рабочая
 // комбинация запоминается. Официально аудио принимают: 3.8/3.7/3.6/3.5 Flash,
 // 3.5/3.1/2.5 Flash-Lite, 2.5 Flash (mime: audio/ogg и audio/opus).
-const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash'
+const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.5-transcribe,gemini-2.5-flash'
 let voiceOk = null // {model, mime} — найденная рабочая комбинация
 
 async function callGemini(env, parts, jsonOut, model) {
@@ -184,7 +184,7 @@ function parseHeardAnswer(raw) {
   return { heard: heard.slice(0, 200), answer: detex(answer) }
 }
 
-async function voiceAttempt(env, model, mime, b64) {
+async function voiceAttempt(env, model, mime, b64, jsonMode) {
   return parseHeardAnswer(
     await callGemini(
       env,
@@ -192,7 +192,7 @@ async function voiceAttempt(env, model, mime, b64) {
         { inline_data: { mime_type: mime, data: b64 } },
         { text: VOICE_INSTR },
       ],
-      true,
+      jsonMode !== false,
       model,
     ),
   )
@@ -246,13 +246,13 @@ async function uploadAudioFile(env, b64, mime) {
   return { uri, mime }
 }
 
-async function voiceAttemptFile(env, model, mime, b64) {
+async function voiceAttemptFile(env, model, mime, b64, jsonMode) {
   const f = await uploadAudioFile(env, b64, mime)
   return parseHeardAnswer(
     await callGemini(
       env,
       [{ file_data: { mime_type: f.mime, file_uri: f.uri } }, { text: VOICE_INSTR }],
-      true,
+      jsonMode !== false,
       model,
     ),
   )
@@ -267,6 +267,13 @@ async function askVoice(env, b64) {
     throw new Error('битный base64')
   }
   if (bytes.length < 100) throw new Error('аудио слишком короткое')
+
+  // диагностика формата: настоящие OggOpus начинаются с 'OggS'
+  let magic = ''
+  try {
+    magic = String.fromCharCode.apply(null, bytes.subarray(0, 4))
+  } catch (e) {}
+  console.error('[aiwatch] аудио: ' + bytes.length + 'Б, магия=' + JSON.stringify(magic))
 
   const models = String(env.VOICE_MODELS || VOICE_DEFAULTS)
     .split(',')
@@ -284,8 +291,8 @@ async function askVoice(env, b64) {
     try {
       const r =
         voiceOk.kind === 'file'
-          ? await voiceAttemptFile(env, voiceOk.model, voiceOk.mime, b64)
-          : await voiceAttempt(env, voiceOk.model, voiceOk.mime, b64)
+          ? await voiceAttemptFile(env, voiceOk.model, voiceOk.mime, b64, voiceOk.jsonMode)
+          : await voiceAttempt(env, voiceOk.model, voiceOk.mime, b64, voiceOk.jsonMode)
       return r
     } catch (e) {
       lastErr = e
@@ -297,34 +304,39 @@ async function askVoice(env, b64) {
   if (!sdkBroken) {
     for (const m of models) {
       try {
-        const r = await voiceAttemptFile(env, m, 'audio/ogg', b64)
-        voiceOk = { kind: 'file', model: m, mime: 'audio/ogg' }
+        const r = await voiceAttemptFile(env, m, 'audio/ogg', b64, true)
+        voiceOk = { kind: 'file', model: m, mime: 'audio/ogg', jsonMode: true }
         return r
       } catch (e) {
         if (String((e && e.message) || e).indexOf('sdk-unavailable') >= 0) {
           sdkBroken = true
           break
         }
+        console.error('[aiwatch] file/' + m + ': ' + String((e && e.message) || e).slice(0, 140))
         lastErr = e
       }
     }
   }
 
-  // 3) инлайн-цепочка (модели x форматы)
-  for (const m of models) {
-    for (const mm of mimes) {
-      try {
-        const r = await voiceAttempt(env, m, mm, b64)
-        voiceOk = { kind: 'inline', model: m, mime: mm }
-        return r
-      } catch (e) {
-        lastErr = e
+  // 3) инлайн-цепочка: сперва с JSON-ответом, потом без (некоторые модели
+  //    отвечают INVALID_ARGUMENT на аудио + responseMimeType)
+  for (const jsonMode of [true, false]) {
+    for (const m of models) {
+      for (const mm of mimes) {
+        try {
+          const r = await voiceAttempt(env, m, mm, b64, jsonMode)
+          voiceOk = { kind: 'inline', model: m, mime: mm, jsonMode: jsonMode }
+          return r
+        } catch (e) {
+          console.error('[aiwatch] inline/' + m + '/' + mm + (jsonMode ? '/json' : '') + ': ' + String((e && e.message) || e).slice(0, 140))
+          lastErr = e
+        }
       }
     }
   }
   console.error('[aiwatch] голос: все попытки провалились, последняя ошибка:', String((lastErr && lastErr.message) || lastErr).slice(0, 200))
   throw new Error(
-    'голос не прошёл ни одним способом; последняя ошибка: ' +
+    'голос не прошёл (' + (magic === 'OggS' ? 'ogg-ок' : 'магия ' + JSON.stringify(magic)) + '); последняя ошибка: ' +
       String((lastErr && lastErr.message) || lastErr).slice(0, 160),
   )
 }
