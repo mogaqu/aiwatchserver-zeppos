@@ -16,11 +16,62 @@ const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models/'
 const SYSTEM_PROMPT =
   'Ты — быстрый ассистент для коротких ответов на вопросы по школьным предметам. ' +
   'Отвечай предельно кратко и по делу: только суть, факты, определения, формулы, списки. ' +
-  'Максимум 700 символов. Без приветствий, без вступлений, без рассуждений. На русском.'
+  'Максимум 700 символов. Без приветствий, без вступлений, без рассуждений. На русском. ' +
+  'Никакого LaTeX и TeX-разметки: не используй знаки доллара, \frac, \Delta, ^ и _ — '
+ +
+  'формулы пиши юникодом (Δ, ×, ·, ≈, →, ², ₂, °), например H₂O, E=mc², C₆H₁₂O₆, a/b.'
 
 const VOICE_INSTR =
   'В аудио — вопрос на русском. Расшифруй его и дай краткий ответ. ' +
   'Верни строго JSON вида {"heard":"расшифровка вопроса","answer":"краткий ответ по существу, до 700 символов"}.'
+
+// ---------- ОЧИСТКА ФОРМУЛ (LaTeX -> юникод) ----------
+const BB = String.fromCharCode(92) // бэкслеш без экранирования
+const TEX_CMD = { Delta: 'Δ', delta: 'δ', alpha: 'α', beta: 'β', gamma: 'γ', Gamma: 'Γ', pi: 'π', Pi: 'Π', mu: 'μ', lambda: 'λ', Lambda: 'Λ', Omega: 'Ω', omega: 'ω', theta: 'θ', phi: 'φ', varphi: 'φ', rho: 'ρ', sigma: 'σ', Sigma: 'Σ', epsilon: 'ε', varepsilon: 'ε', tau: 'τ', eta: 'η', zeta: 'ζ', chi: 'χ', psi: 'ψ', xi: 'ξ', nu: 'ν', kappa: 'κ', times: '×', cdot: '·', div: '÷', pm: '±', mp: '∓', leq: '≤', le: '≤', geq: '≥', ge: '≥', neq: '≠', ne: '≠', approx: '≈', equiv: '≡', propto: '∝', infty: '∞', degree: '°', circ: '°', sum: 'Σ', partial: '∂', nabla: '∇', rightarrow: '→', to: '→', Rightarrow: '⇒', leftarrow: '←', Leftarrow: '⇐', leftrightarrow: '↔', Leftrightarrow: '⇔', quad: ' ', qquad: '  ' }
+const SUP = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '−': '⁻', '(': '⁽', ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ', 'k': 'ᵏ' }
+const SUB = { '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '−': '₋', '(': '₍', ')': '₎', 'n': 'ₙ', 'i': 'ᵢ', 'x': 'ₓ', 'm': 'ₘ' }
+
+function texMap(t, map) {
+  const keys = Object.keys(map).sort((a, b) => b.length - a.length) // длинные ключи раньше
+  for (const k of keys) t = t.split(BB + k).join(map[k])
+  return t
+}
+
+function texSupSub(t, sym, map) {
+  // sym{...} -> юникод (если все символы мапятся), иначе sym(...)
+  const reGroup = new RegExp(BB + sym + BB + '{([^{}]*)' + BB + '}', 'g')
+  t = t.replace(reGroup, (m, g) => {
+    const cs = [...String(g)]
+    return cs.length && cs.every((c) => map[c] !== undefined) ? cs.map((c) => map[c]).join('') : sym + '(' + g + ')'
+  })
+  // symX одиночный символ
+  const reSingle = new RegExp(BB + sym + '([0-9a-zA-Z+' + BB + '-−])', 'g')
+  t = t.replace(reSingle, (m, c) => (map[c] !== undefined ? map[c] : m))
+  return t
+}
+
+function detex(input) {
+  let t = String(input || '')
+  const reFrac = new RegExp(BB + BB + '(?:d|D)?frac' + BB + 's*' + BB + '{([^{}]*)' + BB + '}' + BB + 's*' + BB + '{([^{}]*)' + BB + '}', 'g')
+  const reSqrt = new RegExp(BB + BB + 'sqrt' + BB + 's*' + BB + '{([^{}]*)' + BB + '}', 'g')
+  const reText = new RegExp(BB + BB + '(?:text|mathrm|mathbf|mathit)' + BB + 's*' + BB + '{([^{}]*)' + BB + '}', 'g')
+  const reLeftRight = new RegExp(BB + BB + '(?:left|right)', 'g')
+  for (let i = 0; i < 4; i++) {
+    t = t.replace(reFrac, '($1)/($2)')
+    t = t.replace(reSqrt, '√($1)')
+    t = t.replace(reText, '$1')
+    t = t.replace(reLeftRight, '')
+  }
+  t = texSupSub(t, '^', SUP)
+  t = texSupSub(t, '_', SUB)
+  t = texMap(t, TEX_CMD)
+  t = t.split('^°').join('°').split('_°').join('°') // 36,6^° -> 36,6°
+  t = t.replace(new RegExp(BB + '$', 'g'), '') // знаки доллара
+  t = t.replace(new RegExp(BB + BB + '[a-zA-Z]+', 'g'), '') // остатки команд
+  t = t.replace(/[{}]/g, '')
+  t = t.replace(/ {2,}/g, ' ')
+  return t.trim()
+}
 
 function json(res, obj, status = 200) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' })
@@ -61,7 +112,7 @@ async function callGemini(env, parts, jsonOut) {
 
 async function askText(env, q) {
   if (!q) throw new Error('пустой вопрос')
-  return { answer: await callGemini(env, [{ text: q }], false) }
+  return { answer: detex(await callGemini(env, [{ text: q }], false)) }
 }
 
 async function askVoice(env, b64) {
@@ -92,7 +143,7 @@ async function askVoice(env, b64) {
     // модель ответила без JSON — считаем весь текст ответом
   }
   if (!answer) throw new Error('речь не распознана или пустой ответ')
-  return { heard: heard.slice(0, 200), answer }
+  return { heard: heard.slice(0, 200), answer: detex(answer) }
 }
 
 function readBody(req) {
