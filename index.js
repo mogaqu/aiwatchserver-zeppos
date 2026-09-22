@@ -87,7 +87,7 @@ function fail(res, e) {
 // Голос — через цепочку перебора: модели x mime-форматы, первая рабочая
 // комбинация запоминается. Официально аудио принимают: 3.8/3.7/3.6/3.5 Flash,
 // 3.5/3.1/2.5 Flash-Lite, 2.5 Flash (mime: audio/ogg и audio/opus).
-const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash'
+const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash'
 let voiceOk = null // {model, mime} — найденная рабочая комбинация
 
 async function callGemini(env, parts, jsonOut, model) {
