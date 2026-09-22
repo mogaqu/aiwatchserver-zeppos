@@ -82,7 +82,15 @@ function fail(res, e) {
   json(res, { error: String((e && e.message) || e) }, 502)
 }
 
-async function callGemini(env, parts, jsonOut) {
+// ---------- GEMINI ----------
+// Текст — через GEMINI_MODEL (500/день у lite).
+// Голос — через цепочку перебора: модели x mime-форматы, первая рабочая
+// комбинация запоминается. Официально аудио принимают: 3.8/3.7/3.6/3.5 Flash,
+// 3.5/3.1/2.5 Flash-Lite, 2.5 Flash (mime: audio/ogg и audio/opus).
+const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash'
+let voiceOk = null // {model, mime} — найденная рабочая комбинация
+
+async function callGemini(env, parts, jsonOut, model) {
   if (env.MOCK_GEMINI === '1') {
     return jsonOut
       ? '{"heard":"тест услышан","answer":"Ответ сорок два"}'
@@ -92,7 +100,7 @@ async function callGemini(env, parts, jsonOut) {
   if (jsonOut) generationConfig.responseMimeType = 'application/json'
   if (env.THINKING_LEVEL) generationConfig.thinkingConfig = { thinkingLevel: env.THINKING_LEVEL }
 
-  const r = await fetch(API_BASE + (env.GEMINI_MODEL || 'gemini-3.5-flash-lite') + ':generateContent', {
+  const r = await fetch(API_BASE + (model || env.GEMINI_MODEL || 'gemini-3.5-flash-lite') + ':generateContent', {
     method: 'POST',
     headers: { 'x-goog-api-key': env.GEMINI_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -115,24 +123,7 @@ async function askText(env, q) {
   return { answer: detex(await callGemini(env, [{ text: q }], false)) }
 }
 
-async function askVoice(env, b64) {
-  if (!b64) throw new Error('пустое аудио')
-  let bytes
-  try {
-    bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
-  } catch (e) {
-    throw new Error('битный base64')
-  }
-  if (bytes.length < 100) throw new Error('аудио слишком короткое')
-
-  const raw = await callGemini(
-    env,
-    [
-      { inline_data: { mime_type: env.AUDIO_MIME || 'audio/ogg', data: b64 } },
-      { text: VOICE_INSTR },
-    ],
-    true,
-  )
+function parseHeardAnswer(raw) {
   let heard = ''
   let answer = raw
   try {
@@ -144,6 +135,150 @@ async function askVoice(env, b64) {
   }
   if (!answer) throw new Error('речь не распознана или пустой ответ')
   return { heard: heard.slice(0, 200), answer: detex(answer) }
+}
+
+async function voiceAttempt(env, model, mime, b64) {
+  return parseHeardAnswer(
+    await callGemini(
+      env,
+      [
+        { inline_data: { mime_type: mime, data: b64 } },
+        { text: VOICE_INSTR },
+      ],
+      true,
+      model,
+    ),
+  )
+}
+
+
+// ---------- ГОЛОС ЧЕРЕЗ FILES API (официальный путь) ----------
+// Аудио грузится отдельным запросом (client.files.upload), затем в
+// generateContent уходит file_data-часть со ссылкой. Если SDK недоступен
+// (нет пакета) — молча переходим на инлайн-цепочку.
+let genaiClient = null
+let sdkBroken = false
+if (typeof globalThis !== 'undefined') {
+  // хук для тестов: сброс кэша SDK-клиента
+  globalThis.__genaiReset = () => {
+    genaiClient = null
+    sdkBroken = false
+  }
+}
+
+async function getGenai(env) {
+  if (genaiClient) return genaiClient
+  if (globalThis.__genaiFactory) {
+    // хук для тестов: подставляем фейкового клиента
+    genaiClient = globalThis.__genaiFactory(env)
+    return genaiClient
+  }
+  try {
+    const mod = await import('@google/genai')
+    genaiClient = new mod.GoogleGenAI({ apiKey: env.GEMINI_KEY })
+    return genaiClient
+  } catch (e) {
+    sdkBroken = true
+    throw new Error('sdk-unavailable: ' + String((e && e.message) || e).slice(0, 80))
+  }
+}
+
+async function uploadAudioFile(env, b64, mime) {
+  const client = await getGenai(env)
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
+  const blob = new Blob([bytes], { type: mime })
+  let f = await client.files.upload({ file: blob, config: { mimeType: mime } })
+  // ждём, пока Google обработает файл (обычно мгновенно для коротких)
+  for (let i = 0; i < 20 && f && f.state === 'PROCESSING'; i++) {
+    await new Promise((r) => setTimeout(r, 500))
+    f = await client.files.get({ name: f.name })
+  }
+  if (f && f.state && f.state !== 'ACTIVE') throw new Error('файл не готов: ' + f.state)
+  const uri = f.uri || (f.file && f.file.uri)
+  if (!uri) throw new Error('нет uri после загрузки')
+  return { uri, mime }
+}
+
+async function voiceAttemptFile(env, model, mime, b64) {
+  const f = await uploadAudioFile(env, b64, mime)
+  return parseHeardAnswer(
+    await callGemini(
+      env,
+      [{ file_data: { mime_type: f.mime, file_uri: f.uri } }, { text: VOICE_INSTR }],
+      true,
+      model,
+    ),
+  )
+}
+
+async function askVoice(env, b64) {
+  if (!b64) throw new Error('пустое аудио')
+  let bytes
+  try {
+    bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
+  } catch (e) {
+    throw new Error('битный base64')
+  }
+  if (bytes.length < 100) throw new Error('аудио слишком короткое')
+
+  const models = String(env.VOICE_MODELS || VOICE_DEFAULTS)
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const mimes = String(env.VOICE_MIMES || 'audio/ogg,audio/opus')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+
+  let lastErr = null
+
+  // 1) закэшированная рабочая комбинация
+  if (voiceOk) {
+    try {
+      const r =
+        voiceOk.kind === 'file'
+          ? await voiceAttemptFile(env, voiceOk.model, voiceOk.mime, b64)
+          : await voiceAttempt(env, voiceOk.model, voiceOk.mime, b64)
+      return r
+    } catch (e) {
+      lastErr = e
+      voiceOk = null // кэш протух — ищем заново
+    }
+  }
+
+  // 2) Files API (правильный путь для аудио), перебор моделей
+  if (!sdkBroken) {
+    for (const m of models) {
+      try {
+        const r = await voiceAttemptFile(env, m, 'audio/ogg', b64)
+        voiceOk = { kind: 'file', model: m, mime: 'audio/ogg' }
+        return r
+      } catch (e) {
+        if (String((e && e.message) || e).indexOf('sdk-unavailable') >= 0) {
+          sdkBroken = true
+          break
+        }
+        lastErr = e
+      }
+    }
+  }
+
+  // 3) инлайн-цепочка (модели x форматы)
+  for (const m of models) {
+    for (const mm of mimes) {
+      try {
+        const r = await voiceAttempt(env, m, mm, b64)
+        voiceOk = { kind: 'inline', model: m, mime: mm }
+        return r
+      } catch (e) {
+        lastErr = e
+      }
+    }
+  }
+  throw new Error(
+    'голос не прошёл ни одним способом; последняя ошибка: ' +
+      String((lastErr && lastErr.message) || lastErr).slice(0, 160),
+  )
 }
 
 function readBody(req) {
