@@ -118,9 +118,56 @@ async function callGemini(env, parts, jsonOut, model) {
   return text
 }
 
+// ---------- АВТОПОДБОР МОДЕЛИ ----------
+// Если дефолтная модель отклонена (400/404) — спрашиваем у API список
+// доступных и берём первую подходящую flash-модель (лайты вперёд).
+let modelList = null
+let rejectedModels = new Set() // модели, которые API уже отверг
+async function discoverModels(env) {
+  if (modelList) return modelList
+  try {
+    const r = await fetch(API_BASE, { headers: { 'x-goog-api-key': env.GEMINI_KEY } })
+    if (!r.ok) throw new Error('list ' + r.status)
+    const d = await r.json()
+    const all = (d.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).indexOf('generateContent') >= 0)
+      .map((m) => String(m.name || '').replace(/^models\//, ''))
+      .filter(
+        (n) =>
+          n.indexOf('flash') >= 0 &&
+          n.indexOf('image') < 0 &&
+          n.indexOf('tts') < 0 &&
+          n.indexOf('live') < 0 &&
+          n.indexOf('embedding') < 0,
+      )
+    all.sort((a, b) => (b.indexOf('lite') >= 0 ? 1 : 0) - (a.indexOf('lite') >= 0 ? 1 : 0))
+    modelList = all
+    console.error('[aiwatch] доступны модели:', all.slice(0, 5).join(', '))
+  } catch (e) {
+    console.error('[aiwatch] список моделей не получен:', String((e && e.message) || e).slice(0, 120))
+    modelList = []
+  }
+  return modelList
+}
+
+function isModelReject(msg) {
+  msg = String(msg || '')
+  return msg.indexOf('Gemini 400') >= 0 || msg.indexOf('Gemini 404') >= 0
+}
+
 async function askText(env, q) {
   if (!q) throw new Error('пустой вопрос')
-  return { answer: detex(await callGemini(env, [{ text: q }], false)) }
+  try {
+    return { answer: detex(await callGemini(env, [{ text: q }], false)) }
+  } catch (e) {
+    if (!isModelReject(e && e.message)) throw e
+    console.error('[aiwatch] модель отклонена, пробую автоподбор:', String(e.message).slice(0, 140))
+    rejectedModels.add(env.GEMINI_MODEL || 'gemini-3.5-flash-lite')
+    const list = (await discoverModels(env)).filter((m) => !rejectedModels.has(m))
+    if (!list.length) throw e
+    const text = await callGemini(env, [{ text: q }], false, list[0])
+    return { answer: detex(text) }
+  }
 }
 
 function parseHeardAnswer(raw) {
@@ -224,7 +271,7 @@ async function askVoice(env, b64) {
   const models = String(env.VOICE_MODELS || VOICE_DEFAULTS)
     .split(',')
     .map((s) => s.trim())
-    .filter(Boolean)
+    .filter((m) => m && !rejectedModels.has(m))
   const mimes = String(env.VOICE_MIMES || 'audio/ogg,audio/opus')
     .split(',')
     .map((s) => s.trim())
@@ -275,6 +322,7 @@ async function askVoice(env, b64) {
       }
     }
   }
+  console.error('[aiwatch] голос: все попытки провалились, последняя ошибка:', String((lastErr && lastErr.message) || lastErr).slice(0, 200))
   throw new Error(
     'голос не прошёл ни одним способом; последняя ошибка: ' +
       String((lastErr && lastErr.message) || lastErr).slice(0, 160),
