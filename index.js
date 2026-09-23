@@ -260,6 +260,14 @@ async function voiceAttemptFile(env, model, mime, b64, jsonMode) {
   )
 }
 
+function toB64(u8) {
+  let out = ''
+  for (let i = 0; i < u8.length; i += 0x8000) {
+    out += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000))
+  }
+  return btoa(out)
+}
+
 async function askVoice(env, b64) {
   if (!b64) throw new Error('пустое аудио')
   let bytes
@@ -268,22 +276,37 @@ async function askVoice(env, b64) {
   } catch (e) {
     throw new Error('битный base64')
   }
-  if (bytes.length < 100) throw new Error('аудио слишком короткое')
-
-  // диагностика формата: настоящие OggOpus начинаются с 'OggS'
+  // контейнер по магии + обрезка хвоста из нулей (часы преаллоцируют файл)
   let magic = ''
-  let detected = null // контейнер по магии: OggS=ogg, ftyp=mp4/m4a (AAC), ID3=mp3
+  let detected = null
+  let trimNote = ''
   try {
     magic = String.fromCharCode.apply(null, bytes.subarray(0, 4))
     const b8 = String.fromCharCode.apply(null, bytes.subarray(4, 8))
+    const hex = (u8) =>
+      Array.from(u8)
+        .map((x) => ('0' + x.toString(16)).slice(-2))
+        .join(' ')
+    const headHex = hex(bytes.subarray(0, 16))
+    const tailHex = hex(bytes.subarray(Math.max(0, bytes.length - 8)))
     if (magic === 'OggS') detected = 'audio/ogg'
-    else if (b8 === 'ftyp') detected = 'audio/mp4'
-    else if (magic.slice(0, 3) === 'ID3' || bytes[0] === 0xff) detected = 'audio/mp3'
+    else if (/^[\x20-\x7e]{4}$/.test(b8)) detected = 'audio/mp4' // ISO-BMFF: ftyp/styp/moov/mdat...
+    else if (magic.slice(0, 3) === 'ID3') detected = 'audio/mp3'
+    else if (bytes[0] === 0xff && bytes[1] >= 0xe0) detected = 'audio/aac' // ADTS-поток
+    let end = bytes.length
+    while (end > 200 && bytes[end - 1] === 0) end--
+    if (end < bytes.length) {
+      trimNote = ', нулевой хвост -' + (bytes.length - end) + 'Б'
+      bytes = bytes.subarray(0, end)
+      b64 = toB64(bytes)
+    }
+    console.error(
+      '[aiwatch] аудио: ' + bytes.length + 'Б, голова=' + JSON.stringify(magic + b8) +
+        (detected ? ', контейнер=' + detected : ', НЕОПОЗНАН') + trimNote +
+        ', hex16=' + headHex + ', хвост=' + tailHex,
+    )
   } catch (e) {}
-  console.error(
-    '[aiwatch] аудио: ' + bytes.length + 'Б, магия=' + JSON.stringify(magic) +
-      (detected ? ', контейнер=' + detected : ', НЕОПОЗНАН'),
-  )
+  if (bytes.length < 100) throw new Error('аудио слишком короткое')
 
   const models = String(env.VOICE_MODELS || VOICE_DEFAULTS)
     .split(',')
@@ -347,8 +370,12 @@ async function askVoice(env, b64) {
     }
   }
   console.error('[aiwatch] голос: все попытки провалились, последняя ошибка:', String((lastErr && lastErr.message) || lastErr).slice(0, 200))
+  const quotaNote =
+    String((lastErr && lastErr.message) || '').indexOf('429') >= 0
+      ? ' ЧАСТЬ ПОПЫТОК УПЁРЛАСЬ В ДНЕВНОЙ ЛИМИТ (429); 400 = формат аудио.'
+      : ''
   throw new Error(
-    'голос не прошёл (' + (magic === 'OggS' ? 'ogg-ок' : 'магия ' + JSON.stringify(magic)) + '); последняя ошибка: ' +
+    'голос не прошёл (' + (detected || 'магия ' + JSON.stringify(magic)) + ').' + quotaNote + ' Последняя ошибка: ' +
       String((lastErr && lastErr.message) || lastErr).slice(0, 160),
   )
 }
