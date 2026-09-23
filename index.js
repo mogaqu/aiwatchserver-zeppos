@@ -260,6 +260,113 @@ async function voiceAttemptFile(env, model, mime, b64, jsonMode) {
   )
 }
 
+// ---------- КАСТОМНЫЙ ФОРМАТ ZEPP -> OggOpus ----------
+// Часы пишут поток вида [4Б BE-длина][opus-пакет]...[8Б футер] без контейнера.
+// Распарсиваем и собираем валидный OggOpus (OpusHead+OpusTags+страницы с CRC).
+const OGG_CRC_TABLE = (() => {
+  const t = new Uint32Array(256)
+  for (let i = 0; i < 256; i++) {
+    let c = i << 24
+    for (let k = 0; k < 8; k++) c = c & 0x80000000 ? ((c << 1) ^ 0x04c11db7) >>> 0 : (c << 1) >>> 0
+    t[i] = c >>> 0
+  }
+  return t
+})()
+
+function oggCrc(buf) {
+  let c = 0
+  for (let i = 0; i < buf.length; i++) {
+    c = ((c << 8) ^ OGG_CRC_TABLE[((c >>> 24) ^ buf[i]) & 0xff]) >>> 0
+  }
+  return c >>> 0
+}
+
+function parseLenPrefixedOpus(bytes) {
+  // пробуем трактовать как [BE32 len][пакет]...; допускаем футер 8Б или без него
+  for (const foot of [8, 0]) {
+    const limit = bytes.length - foot
+    const packets = []
+    let off = 0
+    let ok = true
+    while (off + 4 <= limit) {
+      const L = ((bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3]) >>> 0
+      if (L < 2 || L > 1275 || off + 4 + L > limit) { ok = false; break }
+      packets.push(bytes.subarray(off + 4, off + 4 + L))
+      off += 4 + L
+    }
+    if (ok && off === limit && packets.length > 0) {
+      const fh = Array.from(bytes.subarray(bytes.length - foot))
+        .map((x) => ('0' + x.toString(16)).slice(-2))
+        .join(' ')
+      return { packets, footerHex: fh, footer: foot }
+    }
+  }
+  return null
+}
+
+function buildOggOpus(packets) {
+  const SPB = 960 // считаем 20мс на пакет (реальная длительность живёт в TOC каждого пакета)
+  const out = []
+  let pageSeq = 0
+
+  function pushPage(type, granPos, pkts) {
+    const lace = []
+    let bodyLen = 0
+    for (const p of pkts) {
+      const n255 = Math.floor(p.length / 255)
+      for (let i = 0; i < n255; i++) lace.push(255)
+      lace.push(p.length - n255 * 255)
+      bodyLen += p.length
+    }
+    const pg = new Uint8Array(27 + lace.length + bodyLen)
+    pg.set([0x4f, 0x67, 0x67, 0x53, 0, type], 0) // 'OggS', v0, type
+    for (let i = 0; i < 8; i++) pg[6 + i] = Math.floor(granPos / Math.pow(2, 8 * i)) & 0xff
+    pg[14] = 0x4d; pg[15] = 0x46; pg[16] = 0x49; pg[17] = 0x53 // серийник — любой
+    pg[18] = pageSeq & 0xff; pg[19] = (pageSeq >>> 8) & 0xff
+    pg[20] = (pageSeq >>> 16) & 0xff; pg[21] = (pageSeq >>> 24) & 0xff
+    pageSeq++
+    pg[26] = lace.length
+    let o = 27
+    for (let i = 0; i < lace.length; i++) pg[27 + i] = lace[i]
+    o = 27 + lace.length
+    for (const p of pkts) { pg.set(p, o); o += p.length }
+    const crc = oggCrc(pg)
+    pg[22] = crc & 0xff; pg[23] = (crc >>> 8) & 0xff; pg[24] = (crc >>> 16) & 0xff; pg[25] = (crc >>> 24) & 0xff
+    out.push(pg)
+  }
+
+  const head = new Uint8Array(19)
+  head.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64], 0) // 'OpusHead'
+  head[8] = 1 // версия
+  head[9] = 1 // каналы
+  head[10] = 0; head[11] = 0 // pre-skip 0
+  head[12] = 0x80; head[13] = 0xbb; head[14] = 0x46; head[15] = 0x00 // 48000 LE
+  const tags = new Uint8Array(16)
+  tags.set([0x4f, 0x70, 0x75, 0x73, 0x54, 0x61, 0x67, 0x73], 0) // 'OpusTags'
+
+  pushPage(0x02, 0, [head])
+  pushPage(0, 0, [tags])
+
+  let acc = [], accSegs = 0, accBytes = 0, accGran = 0
+  for (const p of packets) {
+    const segs = Math.floor(p.length / 255) + 1
+    if (accSegs + segs > 255 || accBytes + p.length > 60000) {
+      pushPage(0, accGran, acc)
+      acc = []; accSegs = 0; accBytes = 0
+    }
+    acc.push(p); accSegs += segs; accBytes += p.length
+    accGran += SPB
+  }
+  pushPage(0x04, accGran, acc)
+
+  let total = 0
+  for (const pg of out) total += pg.length
+  const all = new Uint8Array(total)
+  let o = 0
+  for (const pg of out) { all.set(pg, o); o += pg.length }
+  return all
+}
+
 function toB64(u8) {
   let out = ''
   for (let i = 0; i < u8.length; i += 0x8000) {
@@ -290,7 +397,7 @@ async function askVoice(env, b64) {
     const headHex = hex(bytes.subarray(0, 16))
     const tailHex = hex(bytes.subarray(Math.max(0, bytes.length - 8)))
     if (magic === 'OggS') detected = 'audio/ogg'
-    else if (/^[\x20-\x7e]{4}$/.test(b8)) detected = 'audio/mp4' // ISO-BMFF: ftyp/styp/moov/mdat...
+    else if (/^[a-zA-Z][a-zA-Z0-9 ]{3}$/.test(b8)) detected = 'audio/mp4' // ISO-BMFF: ftyp/styp/moov/mdat (4CC с буквы)
     else if (magic.slice(0, 3) === 'ID3') detected = 'audio/mp3'
     else if (bytes[0] === 0xff && bytes[1] >= 0xe0) detected = 'audio/aac' // ADTS-поток
     let end = bytes.length
@@ -318,11 +425,42 @@ async function askVoice(env, b64) {
     .filter(Boolean)
   if (detected) mimes = [detected].concat(mimes.filter((m) => m !== detected))
 
+  // 0) кастомный формат Zepp -> OggOpus-обёртка (первый и самый вероятный шанс)
+  let wrapped = null
+  try {
+    const pp = parseLenPrefixedOpus(bytes)
+    if (pp) {
+      wrapped = toB64(buildOggOpus(pp.packets))
+      console.error('[aiwatch] длина-префикс: ' + pp.packets.length + ' опус-пакетов, футер=' + pp.footer + 'Б -> собран OggOpus')
+    } else {
+      console.error('[aiwatch] длина-префикс: не сошлось, шлю как есть')
+    }
+  } catch (e) {
+    console.error('[aiwatch] парсер пакета: ' + String((e && e.message) || e).slice(0, 100))
+  }
+
   let lastErr = null
+
+  // 0a) обёрнутый ogg первыми — по всем моделям
+  if (wrapped) {
+    for (const m of models) {
+      try {
+        const r = await voiceAttempt(env, m, 'audio/ogg', wrapped, true)
+        voiceOk = { kind: 'wrapped', model: m }
+        return r
+      } catch (e) {
+        console.error('[aiwatch] wrapped/' + m + ': ' + String((e && e.message) || e).slice(0, 140))
+        lastErr = e
+      }
+    }
+  }
 
   // 1) закэшированная рабочая комбинация
   if (voiceOk) {
     try {
+      if (voiceOk.kind === 'wrapped' && wrapped) {
+        return await voiceAttempt(env, voiceOk.model, 'audio/ogg', wrapped, true)
+      }
       const r =
         voiceOk.kind === 'file'
           ? await voiceAttemptFile(env, voiceOk.model, voiceOk.mime, b64, voiceOk.jsonMode)
