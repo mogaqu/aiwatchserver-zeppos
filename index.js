@@ -87,8 +87,10 @@ function fail(res, e) {
 // Голос — через цепочку перебора: модели x mime-форматы, первая рабочая
 // комбинация запоминается. Официально аудио принимают: 3.8/3.7/3.6/3.5 Flash,
 // 3.5/3.1/2.5 Flash-Lite, 2.5 Flash (mime: audio/ogg и audio/opus).
-const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash'
+const VOICE_DEFAULTS = 'gemini-3.5-flash-lite,gemini-3.6-flash'
 let voiceOk = null // {model, mime} — найденная рабочая комбинация
+const voiceBad = new Set() // 'model|mime' — комбинации, уже давшие 400 (не тратим время)
+const voiceBudget = 12000 // мс на всю цепочку попыток
 
 async function callGemini(env, parts, jsonOut, model) {
   if (env.MOCK_GEMINI === '1') {
@@ -282,26 +284,42 @@ function oggCrc(buf) {
 }
 
 function parseLenPrefixedOpus(bytes) {
-  // пробуем трактовать как [BE32 len][пакет]...; допускаем футер 8Б или без него
-  for (const foot of [8, 0]) {
+  // [BE32 len][opus-пакет]... ; допускаем футер 8/4/0 Б и ОБРЕЗАННЫЙ хвост
+  // (остановка записи рвёт последний пакет). Возвращаем лучшую разборку.
+  let best = null
+  for (const foot of [8, 4, 0]) {
     const limit = bytes.length - foot
+    if (limit < 10) continue
     const packets = []
     let off = 0
-    let ok = true
-    while (off + 4 <= limit) {
+    let truncated = -1
+    for (;;) {
+      if (off + 4 > limit) break
       const L = ((bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3]) >>> 0
-      if (L < 2 || L > 1275 || off + 4 + L > limit) { ok = false; break }
+      if (L < 2 || L > 1275) { truncated = -1; break }
+      if (off + 4 + L > limit) {
+        // обрыв внутри последнего пакета: берём его только если пакет почти цел
+        truncated = L - (limit - off - 4)
+        break
+      }
       packets.push(bytes.subarray(off + 4, off + 4 + L))
       off += 4 + L
     }
-    if (ok && off === limit && packets.length > 0) {
-      const fh = Array.from(bytes.subarray(bytes.length - foot))
-        .map((x) => ('0' + x.toString(16)).slice(-2))
-        .join(' ')
-      return { packets, footerHex: fh, footer: foot }
+    const rest = limit - off
+    const consumed = off / limit
+    const score = packets.length + consumed
+    if (packets.length >= 5 && consumed > (best ? best.consumed : 0.85)) {
+      best = { packets, footer: foot, consumed, truncated, rest }
+    }
+    if (off === limit && packets.length > 0) {
+      // идеальная разборка
+      return { packets, footer: foot, consumed: 1, truncated: -1, rest: 0 }
+    }
+    if (score > 0 && !best && packets.length >= 5) {
+      best = { packets, footer: foot, consumed, truncated, rest }
     }
   }
-  return null
+  return best
 }
 
 function buildOggOpus(packets) {
@@ -431,7 +449,11 @@ async function askVoice(env, b64) {
     const pp = parseLenPrefixedOpus(bytes)
     if (pp) {
       wrapped = toB64(buildOggOpus(pp.packets))
-      console.error('[aiwatch] длина-префикс: ' + pp.packets.length + ' опус-пакетов, футер=' + pp.footer + 'Б -> собран OggOpus')
+      console.error(
+        '[aiwatch] длина-префикс: ' + pp.packets.length + ' опус-пакетов, футер=' + pp.footer +
+          'Б, разобрано ' + Math.round(pp.consumed * 100) + '%' +
+          (pp.truncated >= 0 ? ' (хвост обрезан на ' + pp.truncated + 'Б)' : '') + ' -> собран OggOpus',
+      )
     } else {
       console.error('[aiwatch] длина-префикс: не сошлось, шлю как есть')
     }
@@ -441,14 +463,21 @@ async function askVoice(env, b64) {
 
   let lastErr = null
 
-  // 0a) обёрнутый ogg первыми — по всем моделям
+  // 0a) обёрнутый ogg первыми — по моделям, с бюджетом и кэшем неудач
   if (wrapped) {
+    const t0 = Date.now()
     for (const m of models) {
+      if (Date.now() - t0 > voiceBudget) {
+        console.error('[aiwatch] wrapped: бюджет исчерпан')
+        break
+      }
+      if (voiceBad.has(m + '|audio/ogg|true')) continue
       try {
         const r = await voiceAttempt(env, m, 'audio/ogg', wrapped, true)
         voiceOk = { kind: 'wrapped', model: m }
         return r
       } catch (e) {
+        if (String((e && e.message) || e).indexOf('Gemini 400') >= 0) voiceBad.add(m + '|audio/ogg|true')
         console.error('[aiwatch] wrapped/' + m + ': ' + String((e && e.message) || e).slice(0, 140))
         lastErr = e
       }
@@ -475,6 +504,7 @@ async function askVoice(env, b64) {
   // 2) Files API (правильный путь для аудио), перебор моделей
   if (!sdkBroken) {
     for (const m of models) {
+      if (voiceBad.has(m + '|file')) continue
       try {
         const fileMime = detected || 'audio/ogg'
         const r = await voiceAttemptFile(env, m, fileMime, b64, true)
@@ -485,6 +515,7 @@ async function askVoice(env, b64) {
           sdkBroken = true
           break
         }
+        if (String((e && e.message) || e).indexOf('Gemini 400') >= 0) voiceBad.add(m + '|file')
         console.error('[aiwatch] file/' + m + ': ' + String((e && e.message) || e).slice(0, 140))
         lastErr = e
       }
@@ -493,14 +524,21 @@ async function askVoice(env, b64) {
 
   // 3) инлайн-цепочка: сперва с JSON-ответом, потом без (некоторые модели
   //    отвечают INVALID_ARGUMENT на аудио + responseMimeType)
+  const chainStart = Date.now()
   for (const jsonMode of [true, false]) {
     for (const m of models) {
       for (const mm of mimes) {
+        if (voiceBad.has(m + '|' + mm + '|' + jsonMode)) continue
+        if (Date.now() - chainStart > voiceBudget) {
+          console.error('[aiwatch] inline: бюджет исчерпан')
+          break
+        }
         try {
           const r = await voiceAttempt(env, m, mm, b64, jsonMode)
           voiceOk = { kind: 'inline', model: m, mime: mm, jsonMode: jsonMode }
           return r
         } catch (e) {
+          if (String((e && e.message) || e).indexOf('Gemini 400') >= 0) voiceBad.add(m + '|' + mm + '|' + jsonMode)
           console.error('[aiwatch] inline/' + m + '/' + mm + (jsonMode ? '/json' : '') + ': ' + String((e && e.message) || e).slice(0, 140))
           lastErr = e
         }
