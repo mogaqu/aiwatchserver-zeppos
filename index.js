@@ -284,44 +284,50 @@ function oggCrc(buf) {
 }
 
 function parseLenPrefixedOpus(bytes) {
-  // [BE32 len][opus-пакет]... ; допускаем футер 8/4/0 Б и ОБРЕЗАННЫЙ хвост
-  // (остановка записи рвёт последний пакет). Возвращаем лучшую разборку.
+  // [BE32 len][запись sub Б подзаголовок + opus-пакет]...[футер 8/4/0Б]
+  // Цепочка длин сходится при ЛЮБОМ sub -> выбираем по «опусности»:
+  // у настоящего потока TOC-байт (первый байт пакета) почти константный.
+  const tocShare = (pkts) => {
+    const cnt = {}
+    let max = 0
+    for (const p of pkts) {
+      const b = p[0]
+      cnt[b] = (cnt[b] || 0) + 1
+      if (cnt[b] > max) max = cnt[b]
+    }
+    return max / pkts.length
+  }
   let best = null
   for (const foot of [8, 4, 0]) {
     const limit = bytes.length - foot
     if (limit < 10) continue
-    const packets = []
-    let off = 0
-    let truncated = -1
-    for (;;) {
-      if (off + 4 > limit) break
-      const L = ((bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3]) >>> 0
-      if (L < 2 || L > 1275) { truncated = -1; break }
-      if (off + 4 + L > limit) {
-        // обрыв внутри последнего пакета: берём его только если пакет почти цел
-        truncated = L - (limit - off - 4)
-        break
+    for (const sub of [0, 8, 4]) {
+      const packets = []
+      let off = 0
+      let truncated = -1
+      for (;;) {
+        if (off + 4 > limit) break
+        const L = ((bytes[off] << 24) | (bytes[off + 1] << 16) | (bytes[off + 2] << 8) | bytes[off + 3]) >>> 0
+        const pl = L - sub
+        if (pl < 2 || pl > 1275) { truncated = -1; break }
+        if (off + 4 + L > limit) { truncated = pl - (limit - off - 4); break }
+        packets.push(bytes.subarray(off + 4 + sub, off + 4 + L))
+        off += 4 + L
       }
-      packets.push(bytes.subarray(off + 4, off + 4 + L))
-      off += 4 + L
-    }
-    const rest = limit - off
-    const consumed = off / limit
-    const score = packets.length + consumed
-    if (packets.length >= 5 && consumed > (best ? best.consumed : 0.85)) {
-      best = { packets, footer: foot, consumed, truncated, rest }
-    }
-    if (off === limit && packets.length > 0) {
-      // идеальная разборка
-      return { packets, footer: foot, consumed: 1, truncated: -1, rest: 0 }
-    }
-    if (score > 0 && !best && packets.length >= 5) {
-      best = { packets, footer: foot, consumed, truncated, rest }
+      if (packets.length < 2) continue
+      const consumed = off / limit
+      const cand = { packets, footer: foot, sub, consumed, truncated, share: tocShare(packets) }
+      const better =
+        !best ||
+        cand.consumed > best.consumed + 1e-9 ||
+        (Math.abs(cand.consumed - best.consumed) < 1e-9 &&
+          (cand.share > best.share + 1e-6 ||
+            (Math.abs(cand.share - best.share) < 1e-6 && cand.packets.length > best.packets.length)))
+      if (better) best = cand
     }
   }
   return best
 }
-
 function buildOggOpus(packets) {
   const SPB = 960 // считаем 20мс на пакет (реальная длительность живёт в TOC каждого пакета)
   const out = []
@@ -454,19 +460,21 @@ async function askVoice(env, b64) {
         let c3 = 0
         for (const p of pp.packets) if ((p[0] & 3) === 3) c3++
         console.error(
-          '[aiwatch] TOC: cfg=' + (b0 >> 3) + ' (' + ((b0 >> 3) < 12 ? 'SILK' : (b0 >> 3) < 16 ? 'SILK-60' : 'CELT') +
+          '[aiwatch] TOC: cfg=' + (b0 >> 3) + ' (' + ((b0 >> 3) < 12 ? 'SILK' : (b0 >> 3) < 16 ? 'гибрид' : 'CELT') +
             '), ' + (((b0 >> 2) & 1) ? 'stereo?!' : 'mono') + ', code=' + (b0 & 3) +
-            '; code3 в ' + Math.round((100 * c3) / pp.packets.length) + '% пакетов',
+            '; однотипных TOC ' + Math.round(100 * pp.share) + '%',
         )
       }
       wrapped = toB64(buildOggOpus(pp.packets))
       console.error(
         '[aiwatch] длина-префикс: ' + pp.packets.length + ' опус-пакетов, футер=' + pp.footer +
           'Б, разобрано ' + Math.round(pp.consumed * 100) + '%' +
-          (pp.truncated >= 0 ? ' (хвост обрезан на ' + pp.truncated + 'Б)' : '') + ' -> собран OggOpus',
+          (pp.truncated >= 0 ? ' (хвост обрезан на ' + pp.truncated + 'Б)' : '') +
+          (pp.sub ? ', подзаг ' + pp.sub + 'Б' : '') + ' -> собран OggOpus',
       )
     } else {
-      console.error('[aiwatch] длина-префикс: не сошлось, шлю как есть')
+      const hx = (o, n) => Array.from(bytes.subarray(o, o + n)).map((x) => ('0' + x.toString(16)).slice(-2)).join(' ')
+      console.error('[aiwatch] длина-префикс: не сошлось; p1=' + hx(60, 16) + ', mid=' + hx(bytes.length >> 1, 16) + ' — шлю как есть')
     }
   } catch (e) {
     console.error('[aiwatch] парсер пакета: ' + String((e && e.message) || e).slice(0, 100))
