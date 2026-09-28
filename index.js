@@ -448,6 +448,17 @@ async function askVoice(env, b64) {
   try {
     const pp = parseLenPrefixedOpus(bytes)
     if (pp) {
+      // TOC-диагностика: у настоящего Opus байт[0] пакета = config<<3 | stereo<<2 | code
+      {
+        const b0 = pp.packets[0][0]
+        let c3 = 0
+        for (const p of pp.packets) if ((p[0] & 3) === 3) c3++
+        console.error(
+          '[aiwatch] TOC: cfg=' + (b0 >> 3) + ' (' + ((b0 >> 3) < 12 ? 'SILK' : (b0 >> 3) < 16 ? 'SILK-60' : 'CELT') +
+            '), ' + (((b0 >> 2) & 1) ? 'stereo?!' : 'mono') + ', code=' + (b0 & 3) +
+            '; code3 в ' + Math.round((100 * c3) / pp.packets.length) + '% пакетов',
+        )
+      }
       wrapped = toB64(buildOggOpus(pp.packets))
       console.error(
         '[aiwatch] длина-префикс: ' + pp.packets.length + ' опус-пакетов, футер=' + pp.footer +
@@ -573,6 +584,8 @@ function readBody(req) {
     req.on('error', reject)
   })
 }
+
+export { parseLenPrefixedOpus, buildOggOpus }
 
 export async function handle(req, res, env) {
   const url = (req.url || '').split('?')[0]
